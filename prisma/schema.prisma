@@ -1,0 +1,521 @@
+// SalonPay Database Schema
+// Multi-tenant SaaS for Room Reservations + Payments
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  OWNER      // Full workspace control
+  ADMIN      // Manage rooms, reservations, validate payments
+  STAFF      // Create reservations, view payments
+  CLIENT     // Create own reservations, upload vouchers
+  TEACHER    // (Sprint 2) Manage classes
+  STUDENT    // (Sprint 2) View own classes
+}
+
+enum ReservationStatus {
+  HOLD       // Initial state, 24h hold
+  CONFIRMED  // Payment validated
+  COMPLETED  // Reservation ended
+  EXPIRED    // Hold expired (24h timeout)
+  CANCELLED  // Manually cancelled
+}
+
+enum PaymentStatus {
+  PENDING    // Awaiting voucher upload
+  VALIDATED  // Admin approved voucher
+  REJECTED   // Admin rejected voucher
+}
+
+enum RatePlanType {
+  HOURLY     // Per hour pricing
+  DAILY      // Per day pricing
+  MONTHLY    // Monthly exclusive pricing
+}
+
+enum DiscountType {
+  PERCENTAGE // e.g., 10% off
+  FIXED      // e.g., $50 off
+}
+
+enum AuditAction {
+  USER_LOGIN
+  USER_LOGOUT
+  USER_CREATED
+  USER_UPDATED
+  USER_DELETED
+  USER_ROLE_CHANGED
+  USER_EMAIL_VERIFIED
+  USER_PASSWORD_RESET_REQUESTED
+  USER_PASSWORD_RESET_COMPLETED
+  USER_REGISTER
+  WORKSPACE_UPDATED
+  ROOM_CREATED
+  ROOM_UPDATED
+  ROOM_DELETED
+  RATE_PLAN_CREATED
+  RATE_PLAN_UPDATED
+  RATE_PLAN_DELETED
+  RESERVATION_CREATED
+  RESERVATION_CONFIRMED
+  RESERVATION_CANCELLED
+  RESERVATION_EXPIRED
+  PAYMENT_UPLOADED
+  PAYMENT_VALIDATED
+  PAYMENT_REJECTED
+}
+
+// ============================================================================
+// WORKSPACE (Tenant)
+// ============================================================================
+
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique // For subdomain (Sprint 2)
+
+  // Settings
+  currency  String   @default("PEN") // PEN, USD
+  timezone  String   @default("America/Lima")
+
+  // Branding (for white-label)
+  logoUrl   String?
+  primaryColor String?
+
+  // Subscription (Sprint 2)
+  plan      String   @default("FREE") // FREE, PRO, ANNUAL
+
+  // WhatsApp Business API (Sprint 2 - PRO feature)
+  whatsappEnabled Boolean @default(false)
+  whatsappPhoneNumberId String? // Phone Number ID from Meta
+  whatsappAccessToken String? // Encrypted access token
+  whatsappBusinessAccountId String? // WhatsApp Business Account ID
+
+  // Metadata
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  users         User[]
+  rooms         Room[]
+  ratePlans     RatePlan[]
+  reservations  Reservation[]
+  payments      Payment[]
+  clientDiscounts ClientDiscount[]
+  auditLogs     AuditLog[]
+
+  @@index([slug])
+}
+
+// ============================================================================
+// USER
+// ============================================================================
+
+model User {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // Authentication
+  email           String
+  passwordHash    String   // Argon2 hashed
+
+  // Profile
+  firstName       String
+  lastName        String
+  phone           String?
+
+  // Authorization
+  role            UserRole @default(CLIENT)
+
+  // Verificacion de email
+  emailVerified              Boolean   @default(false)
+  emailVerificationToken     String?   @unique
+  emailVerificationExpires   DateTime?
+  passwordResetToken         String?   @unique
+  passwordResetExpires       DateTime?
+
+  // Email preferences
+  emailNotifications Boolean @default(true)
+
+  // Google Calendar Integration (Sprint 2)
+  googleCalendarConnected Boolean @default(false)
+  googleCalendarRefreshToken String? // Encrypted OAuth refresh token
+  googleCalendarEmail String?
+  googleCalendarSyncEnabled Boolean @default(true)
+
+  // WhatsApp Integration (Sprint 2)
+  whatsappPhone String? // Número de teléfono con código de país (ej: +51987654321)
+  whatsappNotificationsEnabled Boolean @default(false)
+
+  // Metadata
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  lastLoginAt     DateTime?
+
+  // Relations
+  reservations    Reservation[] @relation("ReservationClient")
+  createdReservations Reservation[] @relation("ReservationCreatedBy")
+  payments        Payment[] @relation("PaymentClient")
+  clientDiscounts ClientDiscount[]
+  refreshTokens   RefreshToken[]
+  auditLogs       AuditLog[]
+
+  @@unique([workspaceId, email]) // Email unique per workspace
+  @@index([workspaceId, role])
+  @@index([workspaceId, email])
+}
+
+// ============================================================================
+// REFRESH TOKEN (JWT Rotation)
+// ============================================================================
+
+model RefreshToken {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  token       String   @unique
+  familyId    String   // For token family tracking (security)
+
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  revokedAt   DateTime? // For manual revocation
+
+  @@index([userId])
+  @@index([token])
+  @@index([familyId])
+}
+
+// ============================================================================
+// ROOM (Salon/Venue)
+// ============================================================================
+
+model Room {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // Basic Info
+  name            String
+  description     String?
+  capacity        Int      @default(1)
+
+  // Cleanup buffer (minutes between reservations)
+  cleanupBuffer   Int      @default(15)
+
+  // Amenities (JSON array)
+  amenities       Json?    // ["WiFi", "Projector", "Whiteboard"]
+
+  // Images
+  images          Json?    // Array of image URLs
+
+  // Status
+  isActive        Boolean  @default(true)
+
+  // Metadata
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  schedules       RoomSchedule[]
+  ratePlans       RatePlan[]
+  reservations    Reservation[]
+
+  @@index([workspaceId, isActive])
+}
+
+// ============================================================================
+// ROOM SCHEDULE (Operating Hours)
+// ============================================================================
+
+model RoomSchedule {
+  id          String   @id @default(cuid())
+  roomId      String
+  room        Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  // Day of week (0 = Sunday, 6 = Saturday)
+  dayOfWeek   Int      // 0-6
+
+  // Operating hours
+  openTime    String   // "08:00" (HH:mm format)
+  closeTime   String   // "22:00"
+
+  // Closed flag
+  isClosed    Boolean  @default(false)
+
+  @@index([roomId])
+  @@unique([roomId, dayOfWeek])
+}
+
+// ============================================================================
+// RATE PLAN (Pricing)
+// ============================================================================
+
+model RatePlan {
+  id              String       @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  roomId          String
+  room            Room         @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  // Plan details
+  name            String       // "Standard Hourly", "Weekend Daily"
+  type            RatePlanType // HOURLY, DAILY, MONTHLY
+
+  // Pricing
+  price           Decimal      @db.Decimal(10, 2) // Base price
+  currency        String       @default("PEN")
+
+  // Deposit requirement (percentage)
+  depositPercent  Int          @default(30) // 30% deposit
+
+  // Validity (optional)
+  validFrom       DateTime?
+  validUntil      DateTime?
+
+  // Status
+  isActive        Boolean      @default(true)
+
+  // Metadata
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  // Relations
+  reservations    Reservation[]
+
+  @@index([workspaceId, roomId, isActive])
+}
+
+// ============================================================================
+// RESERVATION (Booking)
+// ============================================================================
+
+model Reservation {
+  id              String            @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // References
+  roomId          String
+  room            Room              @relation(fields: [roomId], references: [id], onDelete: Restrict)
+
+  ratePlanId      String
+  ratePlan        RatePlan          @relation(fields: [ratePlanId], references: [id], onDelete: Restrict)
+
+  clientId        String
+  client          User              @relation("ReservationClient", fields: [clientId], references: [id], onDelete: Restrict)
+
+  createdById     String
+  createdBy       User              @relation("ReservationCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  // Booking details
+  startTime       DateTime
+  endTime         DateTime
+
+  // Status
+  status          ReservationStatus @default(HOLD)
+
+  // Hold mechanism (24-hour window)
+  holdExpiresAt   DateTime?
+
+  // Pricing
+  totalPrice      Decimal           @db.Decimal(10, 2)
+  depositAmount   Decimal           @db.Decimal(10, 2)
+  currency        String            @default("PEN")
+
+  // Notes
+  notes           String?
+
+  // Cancellation
+  cancelledAt     DateTime?
+  cancellationReason String?
+
+  // Google Calendar Integration (Sprint 2)
+  googleCalendarEventId String? // ID del evento en Google Calendar
+
+  // Metadata
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  // Relations
+  payments        Payment[]
+  receipts        Receipt[]
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, roomId, startTime, endTime])
+  @@index([workspaceId, clientId])
+  @@index([holdExpiresAt]) // For expiry job
+}
+
+// ============================================================================
+// PAYMENT (Payment Tracking)
+// ============================================================================
+
+model Payment {
+  id              String        @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // References
+  reservationId   String
+  reservation     Reservation   @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  clientId        String
+  client          User          @relation("PaymentClient", fields: [clientId], references: [id], onDelete: Restrict)
+
+  // Payment details
+  amount          Decimal       @db.Decimal(10, 2)
+  currency        String        @default("PEN")
+
+  // Status
+  status          PaymentStatus @default(PENDING)
+
+  // Voucher upload
+  voucherUploadId String?       @unique
+  voucherUpload   VoucherUpload? @relation(fields: [voucherUploadId], references: [id])
+
+  // Validation
+  validatedAt     DateTime?
+  validatedBy     String?       // User ID of admin who validated
+  validationNotes String?
+
+  // Rejection
+  rejectedAt      DateTime?
+  rejectedBy      String?       // User ID of admin who rejected
+  rejectionReason String?
+
+  // Metadata
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // Relations
+  receipts        Receipt[]
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, reservationId])
+  @@index([workspaceId, clientId])
+}
+
+// ============================================================================
+// VOUCHER UPLOAD (Payment Proof)
+// ============================================================================
+
+model VoucherUpload {
+  id          String   @id @default(cuid())
+
+  // File details
+  fileName    String
+  filePath    String   // Local path or S3 URL
+  fileSize    Int      // Bytes
+  mimeType    String   // image/jpeg, image/png, application/pdf
+
+  // Upload metadata
+  uploadedAt  DateTime @default(now())
+
+  // Relation
+  payment     Payment?
+
+  @@index([filePath])
+}
+
+// ============================================================================
+// RECEIPT (PDF Generation)
+// ============================================================================
+
+model Receipt {
+  id            String      @id @default(cuid())
+
+  // References
+  reservationId String
+  reservation   Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  paymentId     String
+  payment       Payment     @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  // Receipt details
+  receiptNumber String      @unique // Auto-generated (e.g., REC-2026-0001)
+
+  // PDF
+  pdfPath       String      // Local path or S3 URL
+
+  // Metadata
+  generatedAt   DateTime    @default(now())
+
+  @@index([receiptNumber])
+  @@index([reservationId])
+  @@index([paymentId])
+}
+
+// ============================================================================
+// CLIENT DISCOUNT (Permanent Discounts)
+// ============================================================================
+
+model ClientDiscount {
+  id              String       @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // References
+  clientId        String
+  client          User         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // Discount details
+  name            String       // "VIP Discount"
+  type            DiscountType // PERCENTAGE or FIXED
+  value           Decimal      @db.Decimal(10, 2) // 10 (for 10%) or 50 (for $50 off)
+
+  // Validity
+  validFrom       DateTime?
+  validUntil      DateTime?
+
+  // Status
+  isActive        Boolean      @default(true)
+
+  // Metadata
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([workspaceId, clientId, isActive])
+  @@unique([workspaceId, clientId]) // One discount per client per workspace
+}
+
+// ============================================================================
+// AUDIT LOG (Security & Compliance)
+// ============================================================================
+
+model AuditLog {
+  id              String      @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // Actor
+  userId          String?
+  user            User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Action
+  action          AuditAction
+  entityType      String      // "Payment", "Reservation", "User"
+  entityId        String?
+
+  // Context
+  metadata        Json?       // Additional action-specific data
+  ipAddress       String?
+  userAgent       String?
+
+  // Timestamp
+  createdAt       DateTime    @default(now())
+
+  @@index([workspaceId, action, createdAt])
+  @@index([workspaceId, userId])
+  @@index([workspaceId, entityType, entityId])
+}
